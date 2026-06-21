@@ -122,6 +122,29 @@ int main(int argc, char *argv[])
 
         registerAllFunctions(runtime);
 
+        // Wire the disc image (raw ISO/CD sectors are served from IoPaths.cdImage).
+        // Source it from argv[2] or the PS2X_CD_IMAGE environment variable. This is
+        // set before loadELF on purpose: loadELF -> configureIoPathsFromElf rewrites
+        // the elf/host/cd/mc paths but preserves cdImage, so the disc binding sticks.
+        std::string cdImagePath;
+        if (argc >= 3 && argv[2] && argv[2][0] != '\0')
+        {
+            cdImagePath = argv[2];
+        }
+        else if (const char *envImage = std::getenv("PS2X_CD_IMAGE"); envImage && envImage[0] != '\0')
+        {
+            cdImagePath = envImage;
+        }
+
+        if (!cdImagePath.empty())
+        {
+            PS2Runtime::IoPaths paths = PS2Runtime::getIoPaths();
+            paths.cdImage = std::filesystem::path(cdImagePath);
+            paths.cdRoot = paths.cdImage.parent_path();
+            runtime.setIoPaths(paths);
+            std::cout << "Using disc image: " << paths.cdImage.string() << std::endl;
+        }
+
         if (!runtime.loadELF(filePathStr))
         {
             std::cerr << "Failed to load ELF file: " << filePathStr << std::endl;

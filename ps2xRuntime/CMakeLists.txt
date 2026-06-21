@@ -182,6 +182,11 @@ file(GLOB RUNNER_SRC_FILES CONFIGURE_DEPENDS
     "${CMAKE_CURRENT_SOURCE_DIR}/src/runner/*.cpp"
 )
 
+# register_functions.cpp is the generated registration table (~100k lines). It is
+# compiled as part of the recompiled-output static library below, not the runner,
+# so the unity-built runner does not absorb a multi-megabyte translation unit.
+list(FILTER RUNNER_SRC_FILES EXCLUDE REGEX "register_functions\\.cpp$")
+
 set(RUNNER_MAIN_CPP "${CMAKE_CURRENT_SOURCE_DIR}/src/runner/main.cpp")
 set(ROOT_MAIN_CPP "${CMAKE_CURRENT_SOURCE_DIR}/src/main.cpp")
 
@@ -202,6 +207,95 @@ if(PS2X_ENABLE_RUNNER_UNITY_BUILD)
     )
 endif()
 
+# ---------------------------------------------------------------------------
+# Recompiled guest code: the per-function .cpp emitted by ps2xRecomp.
+#
+# This is one translation unit per recompiled guest function (~8.5k files for
+# Silent Hill 3) plus the generated register_functions.cpp registration table.
+# They are compiled into a static library and linked into ps2EntryRunner.
+#
+# PS2X_RECOMP_OUTPUT_DIR points at the directory holding the generated sources.
+# It defaults to the canonical SH3 output tree but can be overridden at
+# configure time for a different recompilation.
+#
+# Because there are thousands of TUs, the library uses CMake UNITY_BUILD to
+# batch N functions per compiler invocation. This is the standard approach for
+# static-recompilation projects: it collapses ~8.5k clang invocations down to a
+# few hundred, which makes the build tractable in both wall-clock and process
+# overhead without changing the emitted code at all.
+# ---------------------------------------------------------------------------
+set(PS2X_RECOMP_OUTPUT_DIR "/Users/jackrickey/Dev/sh3-recomp/recomp/output-final"
+    CACHE PATH "Directory containing the generated recompiled guest .cpp files")
+option(PS2X_ENABLE_RECOMP_UNITY_BUILD "Batch the recompiled guest TUs with CMake unity build" ON)
+set(PS2X_RECOMP_UNITY_BUILD_BATCH_SIZE 32 CACHE STRING "Unity build batch size for the recompiled guest library")
+
+if(NOT EXISTS "${PS2X_RECOMP_OUTPUT_DIR}")
+    message(FATAL_ERROR
+        "PS2X_RECOMP_OUTPUT_DIR does not exist: ${PS2X_RECOMP_OUTPUT_DIR}\n"
+        "Point it at the directory produced by ps2xRecomp (the per-function .cpp tree).")
+endif()
+
+# The recompiler emits two headers (ps2_recompiled_functions.h, ps2_recompiled_stubs.h)
+# alongside the per-function .cpp. The recompiled TUs include them by quoted name, so they
+# must be on the runtime include path. They are .gitignored generated artifacts, so a fresh
+# checkout will not have them under include/; sync them from PS2X_RECOMP_OUTPUT_DIR at
+# configure time so the build is self-contained and reproducible.
+foreach(PS2X_RECOMP_HEADER ps2_recompiled_functions.h ps2_recompiled_stubs.h)
+    set(PS2X_RECOMP_HEADER_SRC "${PS2X_RECOMP_OUTPUT_DIR}/${PS2X_RECOMP_HEADER}")
+    set(PS2X_RECOMP_HEADER_DST "${CMAKE_CURRENT_SOURCE_DIR}/include/${PS2X_RECOMP_HEADER}")
+    if(NOT EXISTS "${PS2X_RECOMP_HEADER_SRC}")
+        message(FATAL_ERROR "Missing generated header: ${PS2X_RECOMP_HEADER_SRC}")
+    endif()
+    configure_file("${PS2X_RECOMP_HEADER_SRC}" "${PS2X_RECOMP_HEADER_DST}" COPYONLY)
+endforeach()
+
+# The generated register_functions.cpp also lives under PS2X_RECOMP_OUTPUT_DIR. Sync it into
+# src/runner so the registration table tracks the same recompilation as the .cpp tree.
+configure_file(
+    "${PS2X_RECOMP_OUTPUT_DIR}/register_functions.cpp"
+    "${CMAKE_CURRENT_SOURCE_DIR}/src/runner/register_functions.cpp"
+    COPYONLY)
+
+# Per-function recompiled sources (every generated file carries its guest
+# address in the name, e.g. sub_00100230_0x100230.cpp), plus the registration
+# table. register_functions.cpp is excluded from unity batching and compiled on
+# its own because it is a single very large TU.
+file(GLOB PS2X_RECOMP_FUNC_SOURCES CONFIGURE_DEPENDS
+    "${PS2X_RECOMP_OUTPUT_DIR}/*.cpp")
+
+set(PS2X_RECOMP_REGISTER_CPP "${CMAKE_CURRENT_SOURCE_DIR}/src/runner/register_functions.cpp")
+list(FILTER PS2X_RECOMP_FUNC_SOURCES EXCLUDE REGEX "register_functions\\.cpp$")
+
+list(LENGTH PS2X_RECOMP_FUNC_SOURCES PS2X_RECOMP_FUNC_COUNT)
+message(STATUS "ps2_recompiled: ${PS2X_RECOMP_FUNC_COUNT} recompiled function TUs from ${PS2X_RECOMP_OUTPUT_DIR}")
+
+if(PS2X_RECOMP_FUNC_COUNT EQUAL 0)
+    message(FATAL_ERROR "No recompiled .cpp files found under ${PS2X_RECOMP_OUTPUT_DIR}")
+endif()
+if(NOT EXISTS "${PS2X_RECOMP_REGISTER_CPP}")
+    message(FATAL_ERROR "Missing generated register_functions.cpp at ${PS2X_RECOMP_REGISTER_CPP}")
+endif()
+
+add_library(ps2_recompiled STATIC
+    ${PS2X_RECOMP_FUNC_SOURCES}
+    ${PS2X_RECOMP_REGISTER_CPP}
+)
+
+# The recompiled TUs include ps2_runtime_macros.h / ps2_runtime.h / the generated
+# ps2_recompiled_*.h headers, all of which live in the runtime include tree.
+# Linking ps2_runtime PUBLIC also propagates its include dirs and the sse2neon /
+# USE_SSE2NEON setup from the top-level CMakeLists.
+target_link_libraries(ps2_recompiled PUBLIC ps2_runtime)
+
+if(PS2X_ENABLE_RECOMP_UNITY_BUILD)
+    set_target_properties(ps2_recompiled PROPERTIES
+        UNITY_BUILD ON
+        UNITY_BUILD_BATCH_SIZE "${PS2X_RECOMP_UNITY_BUILD_BATCH_SIZE}"
+    )
+    # register_functions.cpp is one enormous TU; keep it out of the unity batches.
+    set_source_files_properties("${PS2X_RECOMP_REGISTER_CPP}" PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON)
+endif()
+
 if(PS2X_DEFAULT_BOOT_ELF_DEFINE)
     target_compile_definitions(ps2EntryRunner PRIVATE
         PS2X_DEFAULT_BOOT_ELF="${PS2X_DEFAULT_BOOT_ELF_DEFINE}"
@@ -218,9 +312,12 @@ target_include_directories(ps2_runtime PUBLIC
 )
 
 target_link_libraries(ps2_runtime PUBLIC ps2_host_backend)
+# ps2_recompiled PUBLIC-links ps2_runtime, so linking it transitively pulls the
+# runtime (and its includes/host backend). Listing ps2_runtime again here would
+# add the archive to the link line twice; keep only ps2_recompiled.
 target_link_libraries(ps2EntryRunner
     PRIVATE
-    ps2_runtime
+    ps2_recompiled
 )
 
 if(PS2X_IS_VITA)

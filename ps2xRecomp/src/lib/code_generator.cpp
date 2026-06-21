@@ -1171,6 +1171,29 @@ namespace ps2recomp
             }
         }
 
+        // Fall-through tail: if control reaches the end of the function body without
+        // having taken an unconditional control transfer (jr/j/jalr-to-noreturn/eret),
+        // execution falls into the next sequential function. The dispatcher resumes at
+        // ctx->pc, so we must advance it to function.end here; otherwise it is left at
+        // the last instruction's own address and the dispatcher cannot make progress
+        // (it sees an unregistered PC inside this function and stalls/recovers).
+        //
+        // Branch/jump terminators handle their own pc updates (including the not-taken
+        // fallthrough for conditional branches) inside handleBranchDelaySlots, so we
+        // only emit this for a body whose final instruction is a plain, non-terminator
+        // instruction.
+        if (!instructions.empty())
+        {
+            const Instruction &last = instructions.back();
+            const bool unconditionalTerminator =
+                (last.isJump && !last.isCall) || // j / unconditional jr-style jump leaving the function
+                last.isReturn;                   // jr $ra / eret style return
+            if (!unconditionalTerminator)
+            {
+                ss << "    ctx->pc = 0x" << std::hex << function.end << "u;\n" << std::dec;
+            }
+        }
+
         ss << "}\n";
         return ss.str();
     }
