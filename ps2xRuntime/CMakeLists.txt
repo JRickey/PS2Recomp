@@ -48,18 +48,9 @@ if(PS2X_IS_VITA)
 
     include("${PS2X_VITASDK}/share/vita.cmake" REQUIRED)
 else()
-    include(FetchContent)
-    set(FETCHCONTENT_QUIET FALSE)
-    set(BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
-    set(BUILD_GAMES OFF CACHE BOOL "" FORCE)
-
-    FetchContent_Declare(
-        raylib
-        GIT_REPOSITORY "https://github.com/raysan5/raylib.git"
-        GIT_TAG "5.5" # we will migrate to 4.2.0 later, trust me it will be better
-        GIT_PROGRESS TRUE
-    )
-    FetchContent_MakeAvailable(raylib)
+    # Desktop host backend: the Rust + SDL3 crate, built by cargo and linked as
+    # a staticlib exporting the ps2_host_* C ABI (see cmake/Ps2HostRs.cmake).
+    include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/Ps2HostRs.cmake")
 endif()
 
 add_library(ps2_host_backend INTERFACE)
@@ -158,7 +149,7 @@ if(PS2X_IS_VITA)
         pthread
     )
 else()
-    target_link_libraries(ps2_host_backend INTERFACE raylib)
+    target_link_libraries(ps2_host_backend INTERFACE ps2_host_rs)
 endif()
 
 add_library(ps2_runtime STATIC
@@ -259,11 +250,6 @@ if(CMAKE_BUILD_TYPE STREQUAL "Release" OR CMAKE_BUILD_TYPE STREQUAL "RelWithDebI
         )
     endif()
  
-endif()
-
-# Work around WinAPI vs raylib symbol clash for CloseWindow on x64
-if(MSVC)
-    target_link_options(ps2EntryRunner PRIVATE "/FORCE:MULTIPLE")
 endif()
 
 install(TARGETS ps2_runtime

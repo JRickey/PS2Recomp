@@ -7,11 +7,17 @@
 #include <unordered_map>
 #include <vector>
 
+struct PS2Host;
+
 class PS2AudioBackend
 {
 public:
     PS2AudioBackend();
     ~PS2AudioBackend();
+
+    // Bind the SDL3 host. The output stream must already be opened by the host
+    // (ps2_host_audio_open) before samples are submitted.
+    void setHost(PS2Host *host) { m_host = host; }
 
     void onVagTransfer(const uint8_t *rdram, uint32_t srcAddr, uint32_t sizeBytes);
     void onVagTransferFromBuffer(const uint8_t *data, uint32_t sizeBytes, uint32_t keyAddr);
@@ -25,6 +31,11 @@ public:
     void stopAll();
     void setAudioReady(bool ready) { m_audioReady = ready; }
 
+    // Output stream format the host was opened with; submitted PCM is resampled
+    // to this rate and mixed to this channel count.
+    static constexpr uint32_t kOutputSampleRate = 48000u;
+    static constexpr uint32_t kOutputChannels = 2u;
+
 private:
     struct DecodedSample
     {
@@ -32,8 +43,7 @@ private:
         uint32_t sampleRate = 44100;
     };
 
-    struct Impl;
-    std::unique_ptr<Impl> m_impl;
+    PS2Host *m_host = nullptr;
     bool m_audioReady = false;
     uint32_t m_mostRecentSampleKey = 0;
     std::vector<DecodedSample> m_loadOrderSamples;
@@ -41,9 +51,7 @@ private:
     std::unordered_map<uint32_t, DecodedSample> m_sampleBank;
     std::mutex m_mutex;
 
-    void playDecodedSample(uint32_t sampleKey, DecodedSample &sample, float pitch, float volume,
-                          bool isBgm = false);
-    void pruneFinishedSounds();
+    void submitDecodedSample(const DecodedSample &sample, float pitch, float volume);
 };
 
 #endif

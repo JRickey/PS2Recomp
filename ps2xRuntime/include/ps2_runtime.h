@@ -30,6 +30,7 @@
 #include "runtime/ps2_vu1.h"
 #include "runtime/ps2_audio.h"
 #include "runtime/ps2_pad.h"
+#include "ps2_host_backend.h"
 
 enum PS2Exception
 {
@@ -586,6 +587,11 @@ public:
     inline PSPadBackend &padBackend() { return m_padBackend; }
     inline const PSPadBackend &padBackend() const { return m_padBackend; }
 
+    // The SDL3 host backend (window/video/audio/input/saves), created in
+    // initialize() and torn down in the destructor. Owned by the runtime.
+    inline PS2Host *host() { return m_host; }
+    inline const PS2Host *host() const { return m_host; }
+
 private:
     struct GuestHeapBlock
     {
@@ -622,6 +628,7 @@ private:
     ps2_iop m_iop;
     PS2AudioBackend m_audioBackend;
     PSPadBackend m_padBackend;
+    PS2Host *m_host = nullptr;
     VU1Interpreter m_vu1;
     R5900Context m_cpuContext;
     mutable std::recursive_mutex m_guestExecutionMutex;

@@ -420,7 +420,12 @@ PS2Runtime::GuestExecutionReleaseScope::~GuestExecutionReleaseScope()
     }
 }
 
-static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint32_t &outHeight)
+// Pull the latest finished GS frame into `outPixels` (tightly packed RGBA8888,
+// outWidth*outHeight*4). Returns false when no frame is available yet, in which
+// case the caller should skip present. The previous scale/letterbox math now
+// lives in the Rust presenter, so this just hands over raw pixels + dimensions.
+static bool UploadFrame(std::vector<uint8_t> &outPixels, PS2Runtime *rt,
+                        uint32_t &outWidth, uint32_t &outHeight)
 {
     static uint64_t s_lastPresentationTick = std::numeric_limits<uint64_t>::max();
     static bool s_hasLatchedInitialFrame = false;
@@ -451,12 +456,7 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
                                                    &sourceFbp,
                                                    &usedPreferredDisplaySource))
     {
-        Image blank = GenImageColor(FB_WIDTH, FB_HEIGHT, MAGENTA);
-        UpdateTexture(tex, blank.data);
-        UnloadImage(blank);
-        outWidth = FB_WIDTH;
-        outHeight = DEFAULT_DISPLAY_HEIGHT;
-        return;
+        return false;
     }
 
     PS2_IF_AGRESSIVE_LOGS({
@@ -509,30 +509,16 @@ static void UploadFrame(Texture2D &tex, PS2Runtime *rt, uint32_t &outWidth, uint
     s_lastWidth = width;
     s_lastHeight = height;
 
-    std::vector<uint8_t> uploadBuffer(DEFAULT_FB_SIZE, 0u);
-    if (!scratch.empty() && width != 0u && height != 0u)
+    if (scratch.empty() || width == 0u || height == 0u)
     {
-        const uint32_t copyWidth = std::min<uint32_t>(width, FB_WIDTH);
-        const uint32_t copyHeight = std::min<uint32_t>(height, FB_HEIGHT);
-        const size_t srcRowBytes = static_cast<size_t>(width) * 4u;
-        const size_t dstRowBytes = static_cast<size_t>(FB_WIDTH) * 4u;
-        const size_t copyRowBytes = static_cast<size_t>(copyWidth) * 4u;
-        for (uint32_t y = 0; y < copyHeight; ++y)
-        {
-            const size_t srcOffset = static_cast<size_t>(y) * srcRowBytes;
-            const size_t dstOffset = static_cast<size_t>(y) * dstRowBytes;
-            if (srcOffset + copyRowBytes > scratch.size() ||
-                dstOffset + copyRowBytes > uploadBuffer.size())
-            {
-                break;
-            }
-            std::memcpy(uploadBuffer.data() + dstOffset, scratch.data() + srcOffset, copyRowBytes);
-        }
+        return false;
     }
 
-    UpdateTexture(tex, uploadBuffer.data());
+    // Hand over the native-resolution RGBA frame; the presenter scales it.
+    outPixels = std::move(scratch);
     outWidth = width;
     outHeight = height;
+    return true;
 }
 
 PS2Runtime::PS2Runtime()
@@ -563,19 +549,12 @@ PS2Runtime::~PS2Runtime()
     {
         requestStop();
         ps2_syscalls::detachAllGuestHostThreads();
-#if defined(PLATFORM_VITA)
         m_audioBackend.stopAll();
         m_audioBackend.setAudioReady(false);
-#else
-        if (IsAudioDeviceReady())
+        if (m_host)
         {
-            CloseAudioDevice();
-            m_audioBackend.setAudioReady(false);
-        }
-#endif
-        if (IsWindowReady())
-        {
-            CloseWindow();
+            ps2_host_destroy(m_host);
+            m_host = nullptr;
         }
 
         m_loadedModules.clear();
@@ -643,15 +622,19 @@ bool PS2Runtime::initialize(const char *title)
             return false;
         }
 
-#if defined(PLATFORM_VITA)
-        InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title); // raylib vita does not support audio
-#else
-        SetConfigFlags(FLAG_WINDOW_RESIZABLE);
-        InitWindow(HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT, title);
-        InitAudioDevice();
-        m_audioBackend.setAudioReady(IsAudioDeviceReady());
-#endif
-        SetTargetFPS(60);
+        m_host = ps2_host_create(title, HOST_WINDOW_WIDTH, HOST_WINDOW_HEIGHT);
+        if (!m_host)
+        {
+            std::cerr << "Failed to create SDL3 host backend" << std::endl;
+            return false;
+        }
+
+        const int audioReady = ps2_host_audio_open(m_host,
+                                                   PS2AudioBackend::kOutputSampleRate,
+                                                   PS2AudioBackend::kOutputChannels);
+        m_audioBackend.setHost(m_host);
+        m_audioBackend.setAudioReady(audioReady != 0);
+        m_padBackend.setHost(m_host);
 
         return true;
     }
@@ -2003,10 +1986,8 @@ void PS2Runtime::run()
 
     RUNTIME_LOG("Starting execution at address 0x" << std::hex << m_cpuContext.pc << std::dec);
 
-    // A blank image to use as a framebuffer
-    Image blank = GenImageColor(FB_WIDTH, FB_HEIGHT, BLANK);
-    Texture2D frameTex = LoadTextureFromImage(blank);
-    UnloadImage(blank);
+    // Reusable RGBA frame buffer handed to the host presenter each frame.
+    std::vector<uint8_t> presentPixels;
 
     g_activeThreads.store(1, std::memory_order_relaxed);
     std::atomic<bool> gameThreadFinished{false};
@@ -2068,29 +2049,15 @@ void PS2Runtime::run()
                           << std::endl;
             }
         });
-        uint32_t presentWidth = FB_WIDTH;
-        uint32_t presentHeight = DEFAULT_DISPLAY_HEIGHT;
-        UploadFrame(frameTex, this, presentWidth, presentHeight);
+        uint32_t presentWidth = 0u;
+        uint32_t presentHeight = 0u;
+        if (UploadFrame(presentPixels, this, presentWidth, presentHeight))
+        {
+            ps2_host_present_frame(m_host, presentPixels.data(), presentWidth, presentHeight);
+        }
 
-        BeginDrawing();
-        ClearBackground(BLACK);
-        const float srcWidth = static_cast<float>(std::max<uint32_t>(1u, presentWidth));
-        const float srcHeight = static_cast<float>(std::max<uint32_t>(1u, presentHeight));
-        const float screenWidth = static_cast<float>(GetScreenWidth());
-        const float screenHeight = static_cast<float>(GetScreenHeight());
-        const float scale = std::min(screenWidth / srcWidth, screenHeight / srcHeight);
-        const float dstWidth = srcWidth * scale;
-        const float dstHeight = srcHeight * scale;
-        const Rectangle srcRect{0.0f, 0.0f, srcWidth, srcHeight};
-        const Rectangle dstRect{
-            (screenWidth - dstWidth) * 0.5f,
-            (screenHeight - dstHeight) * 0.5f,
-            dstWidth,
-            dstHeight};
-        DrawTexturePro(frameTex, srcRect, dstRect, Vector2{0.0f, 0.0f}, 0.0f, WHITE);
-        EndDrawing();
-
-        if (WindowShouldClose())
+        // Service the host event queue; a zero return means quit was requested.
+        if (ps2_host_pump_events(m_host) == 0)
         {
             RUNTIME_LOG("[run] window close requested, breaking out of loop");
             requestStop();
@@ -2149,8 +2116,7 @@ void PS2Runtime::run()
         ps2_syscalls::detachAllGuestHostThreads();
     }
 
-    UnloadTexture(frameTex);
-    CloseWindow();
+    // Host (window/GPU/audio) is torn down in the destructor via ps2_host_destroy.
 
     const int remainingThreads = g_activeThreads.load(std::memory_order_relaxed);
     RUNTIME_LOG("[run] exiting loop, activeThreads=" << remainingThreads);

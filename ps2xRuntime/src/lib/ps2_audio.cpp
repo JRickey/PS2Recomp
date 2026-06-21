@@ -1,67 +1,10 @@
 #include "runtime/ps2_audio.h"
 #include "runtime/ps2_memory.h"
 #include "ps2_host_backend.h"
+#include <algorithm>
+#include <cmath>
 #include <cstring>
 #include <vector>
-
-namespace
-{
-    std::vector<uint8_t> buildWavFromPcm(const int16_t *pcm, size_t sampleCount, uint32_t sampleRate)
-    {
-        const uint32_t dataSize = static_cast<uint32_t>(sampleCount * 2);
-        const uint32_t fileSize = 36 + dataSize;
-        std::vector<uint8_t> wav(8 + fileSize);
-
-        uint8_t *p = wav.data();
-        p[0] = 'R';
-        p[1] = 'I';
-        p[2] = 'F';
-        p[3] = 'F';
-        p[4] = static_cast<uint8_t>(fileSize);
-        p[5] = static_cast<uint8_t>(fileSize >> 8);
-        p[6] = static_cast<uint8_t>(fileSize >> 16);
-        p[7] = static_cast<uint8_t>(fileSize >> 24);
-        p[8] = 'W';
-        p[9] = 'A';
-        p[10] = 'V';
-        p[11] = 'E';
-        p[12] = 'f';
-        p[13] = 'm';
-        p[14] = 't';
-        p[15] = ' ';
-        p[16] = 16;
-        p[17] = 0;
-        p[18] = 0;
-        p[19] = 0;
-        p[20] = 1;
-        p[21] = 0;
-        p[22] = 1;
-        p[23] = 0;
-        p[24] = static_cast<uint8_t>(sampleRate);
-        p[25] = static_cast<uint8_t>(sampleRate >> 8);
-        p[26] = static_cast<uint8_t>(sampleRate >> 16);
-        p[27] = static_cast<uint8_t>(sampleRate >> 24);
-        const uint32_t byteRate = sampleRate * 2;
-        p[28] = static_cast<uint8_t>(byteRate);
-        p[29] = static_cast<uint8_t>(byteRate >> 8);
-        p[30] = static_cast<uint8_t>(byteRate >> 16);
-        p[31] = static_cast<uint8_t>(byteRate >> 24);
-        p[32] = 2;
-        p[33] = 0;
-        p[34] = 16;
-        p[35] = 0;
-        p[36] = 'd';
-        p[37] = 'a';
-        p[38] = 't';
-        p[39] = 'a';
-        p[40] = static_cast<uint8_t>(dataSize);
-        p[41] = static_cast<uint8_t>(dataSize >> 8);
-        p[42] = static_cast<uint8_t>(dataSize >> 16);
-        p[43] = static_cast<uint8_t>(dataSize >> 24);
-        std::memcpy(p + 44, pcm, dataSize);
-        return wav;
-    }
-}
 
 namespace ps2_vag
 {
@@ -69,24 +12,11 @@ namespace ps2_vag
                 std::vector<int16_t> &outPcm, uint32_t &outSampleRate);
 }
 
-struct PS2AudioBackend::Impl
-{
-    struct TrackedSound
-    {
-        Sound snd;
-        uint32_t sampleKey;
-    };
-    std::vector<TrackedSound> activeSounds;
-};
-
-PS2AudioBackend::PS2AudioBackend() : m_impl(std::make_unique<Impl>())
-{
-}
+PS2AudioBackend::PS2AudioBackend() = default;
 
 PS2AudioBackend::~PS2AudioBackend()
 {
-    if (m_impl)
-        stopAll();
+    stopAll();
 }
 
 void PS2AudioBackend::onVagTransfer(const uint8_t *rdram, uint32_t srcAddr, uint32_t sizeBytes)
@@ -196,20 +126,17 @@ void PS2AudioBackend::play(uint32_t sampleAddr, float pitch, float volume, uint3
 {
     std::lock_guard<std::mutex> lock(m_mutex);
     DecodedSample *sampleToPlay = nullptr;
-    uint32_t sampleKey = 0;
 
     auto it = m_sampleBank.find(sampleAddr & PS2_RAM_MASK);
     if (it != m_sampleBank.end())
     {
         sampleToPlay = &it->second;
-        sampleKey = it->first;
     }
     else if (voiceIndex != 0xFFFFFFFFu &&
              voiceIndex < m_loadOrderSamples.size() &&
              voiceIndex < m_loadOrderSampleKeys.size())
     {
         sampleToPlay = &m_loadOrderSamples[voiceIndex];
-        sampleKey = m_loadOrderSampleKeys[voiceIndex];
     }
     else
     {
@@ -217,94 +144,52 @@ void PS2AudioBackend::play(uint32_t sampleAddr, float pitch, float volume, uint3
         if (it == m_sampleBank.end())
             return;
         sampleToPlay = &it->second;
-        sampleKey = it->first;
     }
     if (!sampleToPlay || sampleToPlay->pcm.empty())
         return;
 
-    const bool isBgm = (sampleToPlay->pcm.size() > static_cast<size_t>(sampleToPlay->sampleRate * 5));
-    playDecodedSample(sampleKey, *sampleToPlay, pitch, volume, isBgm);
+    submitDecodedSample(*sampleToPlay, pitch, volume);
 }
 
-void PS2AudioBackend::pruneFinishedSounds()
+// Resample a decoded mono sample to the host output rate, apply pitch + volume,
+// expand to interleaved stereo, and push it to the host audio stream.
+//
+// NOTE (tracked gap): this is a per-sample submit, not a true SPU2 voice mixer.
+// Concurrent voices are summed by the host stream's queue rather than mixed
+// sample-accurately, and ADSR/loop points are not honored. The real continuous
+// PCM seam is wired (ps2_host_audio_submit); the full 24-voice SPU2 mixer is a
+// separately tracked core-side task. See notes/documentation/host-seam.md A.3.
+void PS2AudioBackend::submitDecodedSample(const DecodedSample &sample, float pitch, float volume)
 {
-#if defined(PLATFORM_VITA)
-    return;
-#else
-    auto &sounds = m_impl->activeSounds;
-    auto it = sounds.begin();
-    while (it != sounds.end())
-    {
-        if (!IsSoundPlaying(it->snd))
-        {
-            UnloadSound(it->snd);
-            it = sounds.erase(it);
-        }
-        else
-        {
-            ++it;
-        }
-    }
-#endif
-}
-
-void PS2AudioBackend::playDecodedSample(uint32_t sampleKey, DecodedSample &sample, float pitch, float volume,
-                                        bool isBgm)
-{
-#if defined(PLATFORM_VITA)
-    (void)sampleKey;
-    (void)sample;
-    (void)pitch;
-    (void)volume;
-    (void)isBgm;
-    return;
-#else
-    if (!m_audioReady || sample.pcm.empty())
+    if (!m_host || !m_audioReady || sample.pcm.empty())
         return;
 
-    pruneFinishedSounds();
-
-    for (const auto &t : m_impl->activeSounds)
-    {
-        if (t.sampleKey == sampleKey && IsSoundPlaying(t.snd))
-            return;
-    }
-
-    auto &sounds = m_impl->activeSounds;
-    if (isBgm)
-    {
-        for (auto it = sounds.begin(); it != sounds.end();)
-        {
-            if (IsSoundPlaying(it->snd))
-            {
-                StopSound(it->snd);
-                UnloadSound(it->snd);
-                it = sounds.erase(it);
-            }
-            else
-                ++it;
-        }
-    }
-
-    constexpr int kMaxConcurrentSounds = 4;
-    while (static_cast<int>(sounds.size()) >= kMaxConcurrentSounds)
-    {
-        StopSound(sounds.front().snd);
-        UnloadSound(sounds.front().snd);
-        sounds.erase(sounds.begin());
-    }
-
-    std::vector<uint8_t> wav = buildWavFromPcm(sample.pcm.data(), sample.pcm.size(), sample.sampleRate);
-    Wave wave = LoadWaveFromMemory(".wav", wav.data(), static_cast<int>(wav.size()));
-    if (wave.frameCount <= 0)
+    const double srcRate = static_cast<double>(sample.sampleRate) * std::max(0.01f, pitch);
+    const double dstRate = static_cast<double>(kOutputSampleRate);
+    const double step = srcRate / dstRate;
+    const size_t srcFrames = sample.pcm.size();
+    const size_t dstFrames = static_cast<size_t>(static_cast<double>(srcFrames) / step);
+    if (dstFrames == 0)
         return;
-    Sound snd = LoadSoundFromWave(wave);
-    UnloadWave(wave);
-    SetSoundPitch(snd, pitch);
-    SetSoundVolume(snd, volume);
-    m_impl->activeSounds.push_back({snd, sampleKey});
-    PlaySound(snd);
-#endif
+
+    std::vector<int16_t> out(dstFrames * kOutputChannels);
+    const float vol = std::clamp(volume, 0.0f, 1.0f);
+    double srcPos = 0.0;
+    for (size_t i = 0; i < dstFrames; ++i)
+    {
+        // Linear interpolation between adjacent source samples.
+        const size_t idx = static_cast<size_t>(srcPos);
+        const double frac = srcPos - static_cast<double>(idx);
+        const int16_t a = sample.pcm[std::min(idx, srcFrames - 1)];
+        const int16_t b = sample.pcm[std::min(idx + 1, srcFrames - 1)];
+        const double mixed = (static_cast<double>(a) * (1.0 - frac) + static_cast<double>(b) * frac) * vol;
+        const int16_t s = static_cast<int16_t>(std::clamp(mixed, -32768.0, 32767.0));
+        out[i * kOutputChannels + 0] = s;
+        out[i * kOutputChannels + 1] = s;
+        srcPos += step;
+    }
+
+    ps2_host_audio_submit(m_host, out.data(), static_cast<uint32_t>(dstFrames));
 }
 
 void PS2AudioBackend::stop(uint32_t voiceId)
@@ -315,14 +200,6 @@ void PS2AudioBackend::stop(uint32_t voiceId)
 void PS2AudioBackend::stopAll()
 {
     std::lock_guard<std::mutex> lock(m_mutex);
-#if defined(PLATFORM_VITA)
-    return;
-#else
-    for (auto &t : m_impl->activeSounds)
-    {
-        StopSound(t.snd);
-        UnloadSound(t.snd);
-    }
-    m_impl->activeSounds.clear();
-#endif
+    if (m_host)
+        ps2_host_audio_clear(m_host);
 }

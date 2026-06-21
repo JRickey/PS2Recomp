@@ -1,0 +1,9 @@
+# SPDX-License-Identifier: GPL-3.0-or-later
+#
+# Help sdl3-sys' pkg-config probe find a system SDL3 on platforms where it is
+# not on the default search path. On macOS the Homebrew sdl3 keg is not in the
+# global pkg-config path, so point at it here. `force = false` means a value
+# already present in the environment (e.g. one CMake passes in) wins, keeping
+# Linux/Windows on their normal pkg-config discovery.
+[env]
+PKG_CONFIG_PATH = { value = "/opt/homebrew/opt/sdl3/lib/pkgconfig", force = false, relative = false }
