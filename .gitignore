@@ -5,6 +5,7 @@ out
 .vscode
 build
 build-sdl3/
+build-combined/
 
 # Rust host crate build artifacts (source under ps2xRuntime/host-rs/ is tracked)
 ps2xRuntime/host-rs/target/
